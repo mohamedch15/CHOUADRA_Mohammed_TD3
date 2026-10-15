@@ -1,7 +1,9 @@
 package fr.uha.miage.plateforme.serveur;
 
+import fr.uha.miage.plateforme.jeu.ActionInvalideException;
 import fr.uha.miage.plateforme.jeu.Jeu;
 import fr.uha.miage.plateforme.jeu.Partie;
+import fr.uha.miage.plateforme.jeu.ResultatPartie;
 import fr.uha.miage.plateforme.jeu.Vue;
 import fr.uha.miage.plateforme.protocole.CodeErreur;
 import fr.uha.miage.plateforme.protocole.Message;
@@ -9,6 +11,7 @@ import fr.uha.miage.plateforme.protocole.Verbes;
 import java.security.SecureRandom;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HexFormat;
@@ -36,6 +39,9 @@ public final class Plateforme implements AutoCloseable {
 
     private static final System.Logger LOG = System.getLogger(Plateforme.class.getName());
     private static final Pattern PSEUDO = Pattern.compile("[A-Za-z0-9_-]{1,20}");
+    static final String RAISON_NORMALE = "NORMALE";
+    static final String RAISON_ABANDON = "ABANDON";
+    static final String RAISON_DECONNEXION = "DECONNEXION";
 
     public record Parametres(Duration delaiInvitation, Duration intervalleHeartbeat, Duration timeoutHeartbeat,
                              Duration intervalleVerification) {
@@ -54,6 +60,7 @@ public final class Plateforme implements AutoCloseable {
     private final Map<String, Invitation> invitations = new HashMap<>();
     private final Map<String, String> invitationsTerminees = historiqueBorne();
     private final Map<String, PartieEnCours> parties = new ConcurrentHashMap<>();
+    private final Map<String, String> partiesTerminees = Collections.synchronizedMap(historiqueBorne());
     private final AtomicLong compteurInvitations = new AtomicLong();
     private final AtomicLong compteurParties = new AtomicLong();
     private final ScheduledThreadPoolExecutor planificateur;
@@ -115,13 +122,15 @@ public final class Plateforme implements AutoCloseable {
         }
     }
 
-    /** Retire un joueur de la plateforme ; sans effet si c'est déjà fait. */
+    /** Retire un joueur de la plateforme (en abandonnant sa partie éventuelle) ; sans effet si c'est déjà fait. */
     public void deconnecter(Joueur joueur, String raison) {
+        PartieEnCours partieAbandonnee;
         verrou.lock();
         try {
             if (!joueur.marquerDeconnecte()) {
                 return;
             }
+            partieAbandonnee = joueur.partie();
             joueurs.remove(cle(joueur.pseudo()));
             parJeton.remove(joueur.jeton());
             annulerInvitationsDe(joueur, joueur.pseudo() + " a quitté la plateforme.", joueur);
@@ -131,6 +140,9 @@ public final class Plateforme implements AutoCloseable {
             verrou.unlock();
         }
         joueur.canal().fermer();
+        if (partieAbandonnee != null) {
+            terminerParAbandon(partieAbandonnee, joueur, RAISON_DECONNEXION);
+        }
     }
 
     public void definirDisponibilite(Joueur joueur, boolean disponible) throws ErreurPlateforme {
@@ -401,6 +413,115 @@ public final class Plateforme implements AutoCloseable {
 
     public int nombrePartiesEnCours() {
         return parties.size();
+    }
+
+    // ---------------------------------------------------------------- déroulement des parties
+
+    /**
+     * Les actions d'une même partie sont sérialisées par le verrou de cette partie ; les autres parties
+     * et la présence des joueurs n'en souffrent pas. Le verrou de la plateforme n'est pris qu'après coup.
+     */
+    public void jouer(Joueur joueur, String idPartie, String action) throws ErreurPlateforme {
+        verifierConnecte(joueur);
+        PartieEnCours enCours = partieAccessible(joueur, idPartie);
+        ResultatPartie fin = null;
+        enCours.verrou().lock();
+        try {
+            if (enCours.estTerminee()) {
+                throw partieTerminee(idPartie);
+            }
+            try {
+                enCours.partie().jouer(joueur.pseudo(), action);
+            } catch (ActionInvalideException e) {
+                throw new ErreurPlateforme(CodeErreur.ACTION_INVALIDE, e.getMessage());
+            } catch (RuntimeException e) {
+                LOG.log(System.Logger.Level.ERROR, "Erreur interne du jeu " + enCours.jeu().id(), e);
+                throw new ErreurPlateforme(CodeErreur.ERREUR_INTERNE, "Le jeu a rencontré une erreur interne.");
+            }
+            envoyerVues(enCours);
+            Optional<ResultatPartie> resultat = enCours.partie().resultat();
+            if (resultat.isPresent() && enCours.marquerTerminee()) {
+                fin = resultat.get();
+            }
+        } finally {
+            enCours.verrou().unlock();
+        }
+        if (fin != null) {
+            finaliser(enCours, fin, RAISON_NORMALE);
+        }
+    }
+
+    public void abandonner(Joueur joueur, String idPartie) throws ErreurPlateforme {
+        verifierConnecte(joueur);
+        PartieEnCours enCours = partieAccessible(joueur, idPartie);
+        if (!terminerParAbandon(enCours, joueur, RAISON_ABANDON)) {
+            throw partieTerminee(idPartie);
+        }
+    }
+
+    private PartieEnCours partieAccessible(Joueur joueur, String idPartie) throws ErreurPlateforme {
+        PartieEnCours enCours = parties.get(idPartie);
+        if (enCours == null) {
+            if (partiesTerminees.containsKey(idPartie)) {
+                throw partieTerminee(idPartie);
+            }
+            throw new ErreurPlateforme(CodeErreur.PARTIE_INCONNUE, "Partie inconnue : « " + idPartie + " ».");
+        }
+        if (!enCours.participants().contains(joueur)) {
+            throw new ErreurPlateforme(CodeErreur.NON_PARTICIPANT, "Vous ne participez pas à la partie " + idPartie + ".");
+        }
+        return enCours;
+    }
+
+    private static ErreurPlateforme partieTerminee(String idPartie) {
+        return new ErreurPlateforme(CodeErreur.PARTIE_TERMINEE, "La partie " + idPartie + " est déjà terminée.");
+    }
+
+    /** Retourne false si la partie était déjà terminée. */
+    private boolean terminerParAbandon(PartieEnCours enCours, Joueur fautif, String raison) {
+        ResultatPartie resultat;
+        enCours.verrou().lock();
+        try {
+            if (!enCours.marquerTerminee()) {
+                return false;
+            }
+            resultat = enCours.partie().abandonner(fautif.pseudo());
+            if (RAISON_DECONNEXION.equals(raison)) {
+                resultat = new ResultatPartie(resultat.issues(),
+                        fautif.pseudo() + " s'est déconnecté : la partie est terminée.");
+            }
+            envoyerVues(enCours);
+        } finally {
+            enCours.verrou().unlock();
+        }
+        finaliser(enCours, resultat, raison);
+        return true;
+    }
+
+    private void envoyerVues(PartieEnCours enCours) {
+        for (Joueur participant : enCours.participants()) {
+            participant.envoyer(messageVue(enCours, participant));
+        }
+    }
+
+    /** Libère les participants encore connectés : ils redeviennent disponibles pour une nouvelle partie. */
+    private void finaliser(PartieEnCours enCours, ResultatPartie resultat, String raison) {
+        verrou.lock();
+        try {
+            parties.remove(enCours.id());
+            partiesTerminees.put(enCours.id(), "terminée");
+            for (Joueur participant : enCours.participants()) {
+                participant.definirPartie(null);
+                if (participant.estConnecte()) {
+                    participant.definirEtat(EtatJoueur.DISPONIBLE);
+                    participant.envoyer(Message.of(Verbes.FIN_PARTIE, enCours.id(),
+                            resultat.issuePour(participant.pseudo()), raison, resultat.resume()));
+                    diffuserPresence(participant);
+                }
+            }
+        } finally {
+            verrou.unlock();
+        }
     }
 
     // ---------------------------------------------------------------- utilitaires

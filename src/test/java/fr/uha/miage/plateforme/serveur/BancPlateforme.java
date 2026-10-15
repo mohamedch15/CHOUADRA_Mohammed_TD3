@@ -23,7 +23,11 @@ final class BancPlateforme implements AutoCloseable {
     }
 
     BancPlateforme(Plateforme.Parametres parametres) {
-        this.plateforme = new Plateforme(CatalogueJeux.depuis(JeuxStandard.modules()), parametres);
+        this(CatalogueJeux.depuis(JeuxStandard.modules()), parametres);
+    }
+
+    BancPlateforme(CatalogueJeux catalogue, Plateforme.Parametres parametres) {
+        this.plateforme = new Plateforme(catalogue, parametres);
     }
 
     Participant connecter(String pseudo, String... jeux) throws ErreurPlateforme {
